@@ -13,8 +13,15 @@
   不可变成果包，重复请求幂等返回已封存包；
 - 包内容在封存时刻一次性冻结：正式断言撤回、后续修订、新定版都不会改变包内容。
 
-校验失败（输入空 / 不足两个 / 重复 / 含空编号 / 定版不存在 / 地层未登记）显式
-拒绝，事务回滚，不留半成品。
+成员时点一致性：入选地层必须全部是**该定版的成员**（定版封存时刻已登记）。
+带成员清单的定版按清单判定，版外地层（定版后才登记）明确拒绝
+（400 `STRATUM_NOT_IN_VERSION`），不与版内真实未定混淆；缺少成员清单的既有
+定版只在其冻结断言 / 冻结结论足以证实时认定成员，无法证实时明确拒绝
+（409 `SNAPSHOT_MEMBERSHIP_UNDETERMINABLE`），不伪造关系。已封成果包内容保持
+原样：同定版 + 同集合的重复封存仍幂等返回已封存的那一份。
+
+校验失败（输入空 / 不足两个 / 重复 / 含空编号 / 定版不存在 / 地层未登记 /
+版外地层 / 成员不可判定）显式拒绝，事务回滚，不留半成品。
 """
 from __future__ import annotations
 
@@ -25,6 +32,7 @@ from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 from psycopg2.extras import Json
 
 from .db import db_conn
+from . import snapshot_members
 from .derivation import RELATION_LABELS
 from .errors import ApiError
 from .models import PackageIn
@@ -80,17 +88,24 @@ def _validate_strata(raw: Sequence[str]) -> List[str]:
     return sorted(seen)
 
 
-def _load_snapshot(cur, version: int) -> Tuple[int, Optional[str], Dict[str, Dict[str, Any]]]:
-    """读取定版及其冻结断言副本。定版不存在明确拒绝。
+def _load_snapshot(
+    cur, version: int
+) -> Tuple[int, Optional[str], Dict[str, Dict[str, Any]], Optional[List[str]]]:
+    """读取定版及其冻结断言副本、成员清单。定版不存在明确拒绝。
 
-    返回 (定版修订号, 定版备注, 以证据编号为键的冻结原始断言)。
+    返回 (定版修订号, 定版备注, 以证据编号为键的冻结原始断言, 定版成员清单)。
     冻结断言固定带 status=active（定版保存的就是当时生效断言，后续撤回不改变包）。
+    成员清单为 None 表示本列引入前封存的既有定版：成员身份只按其冻结断言 /
+    冻结结论证实（见 snapshot_members），无法证实的地层按不可判定拒绝。
     """
-    cur.execute("SELECT revision, label, assertions FROM snapshots WHERE version = %s", (version,))
+    cur.execute(
+        "SELECT revision, label, assertions, members FROM snapshots WHERE version = %s",
+        (version,),
+    )
     row = cur.fetchone()
     if row is None:
         raise ApiError(404, "SNAPSHOT_NOT_FOUND", f"定版不存在: {version}", {"version": version})
-    revision, label, raw_assertions = row[0], row[1], list(row[2])
+    revision, label, raw_assertions, members = row[0], row[1], list(row[2]), row[3]
     by_id: Dict[str, Dict[str, Any]] = {}
     for a in raw_assertions:
         by_id[a["evidence_id"]] = {
@@ -100,7 +115,7 @@ def _load_snapshot(cur, version: int) -> Tuple[int, Optional[str], Dict[str, Dic
             "relation": a["relation"],
             "status": "active",
         }
-    return revision, label, by_id
+    return revision, label, by_id, (None if members is None else list(members))
 
 
 def _ensure_registered(cur, strata: Sequence[str]) -> None:
@@ -178,6 +193,16 @@ def _build_pairs(
 
 
 # ------------------------------------------------------------------ 封存
+def _find_by_key(cur, version: int, strata_key: str) -> Optional[tuple]:
+    """按 (定版, 集合指纹) 读取已封存成果包；不存在返回 None。"""
+    cur.execute(
+        f"SELECT {_SELECT_COLUMNS} FROM thematic_packages "
+        "WHERE version = %s AND strata_key = %s",
+        (version, strata_key),
+    )
+    return cur.fetchone()
+
+
 def create_package(body: PackageIn) -> Tuple[Dict[str, Any], bool]:
     """封存专题成果包。返回 (成果包内容, 是否首次创建)。
 
@@ -186,16 +211,50 @@ def create_package(body: PackageIn) -> Tuple[Dict[str, Any], bool]:
     仅一个事务写入，其余事务取不到 RETURNING 行，转读已提交的同一份包，返回 200
     幂等结果（不存在 SELECT FOR UPDATE 锁不住“尚不存在的行”的竞态）。全部校验
     通过后才插入，任何失败回滚不留半成品。
+
+    成员时点一致性：入选地层须全部为该定版成员（定版封存时刻已登记）。带成员
+    清单的定版按清单判定，版外地层按 400 STRATUM_NOT_IN_VERSION 拒绝；缺少成员
+    清单的既有定版只在其冻结断言 / 冻结结论足以证实时认定成员，无法证实的地层
+    按 409 SNAPSHOT_MEMBERSHIP_UNDETERMINABLE 拒绝——均不伪造“未定”关系行。
+    已封成果包保持原样：同定版 + 同集合的重复封存即使落在成员拒绝分支，也仍
+    幂等返回已封存的那一份（HTTP 200，already_exists=true）。
     """
     # 纯输入校验先做（空 / 不足两个 / 重复 / 空编号），不触碰数据库
     selected = _validate_strata(body.strata)
 
     with db_conn() as conn:
         with conn.cursor() as cur:
-            revision, label, frozen_assertions = _load_snapshot(cur, body.version)
+            revision, label, frozen_assertions, members = _load_snapshot(cur, body.version)
             _ensure_registered(cur, selected)
 
             strata_key = _strata_key(body.version, selected)
+
+            # 定版成员校验：只接受版内成员；版外 / 不可判定明确拒绝。
+            # 幂等重放豁免：同集合成品包已封存的，仍返回那一份（已封内容保持原样）。
+            assertion_strata = snapshot_members.frozen_assertion_strata(frozen_assertions.values())
+            not_member, undeterminable = snapshot_members.collect_non_members(
+                cur, body.version, members, assertion_strata, selected
+            )
+            if not_member or undeterminable:
+                existing = _find_by_key(cur, body.version, strata_key)
+                if existing is not None:
+                    return _serialize(existing), False
+                if not_member:
+                    raise ApiError(
+                        400,
+                        "STRATUM_NOT_IN_VERSION",
+                        f"地层不在定版 {body.version} 的成员清单内（定版封存后才登记）: "
+                        f"{', '.join(not_member)}",
+                        {"version": body.version, "stratum_ids": not_member},
+                    )
+                raise ApiError(
+                    409,
+                    "SNAPSHOT_MEMBERSHIP_UNDETERMINABLE",
+                    f"定版 {body.version} 为缺少成员清单的既有定版，其封存记录不足以证实地层 "
+                    f"{', '.join(undeterminable)} 在定版时刻已登记，成员身份不可判定",
+                    {"version": body.version, "stratum_ids": undeterminable},
+                )
+
             pairs, evidence, transit = _build_pairs(cur, body.version, selected, frozen_assertions)
             content_hash = hashlib.sha256(
                 _canonical(
@@ -234,12 +293,7 @@ def create_package(body: PackageIn) -> Tuple[Dict[str, Any], bool]:
 
             if inserted is None:
                 # 同集合已被（可能在并发事务中）封存：读取那一份冻结内容
-                cur.execute(
-                    f"SELECT {_SELECT_COLUMNS} FROM thematic_packages "
-                    "WHERE version = %s AND strata_key = %s",
-                    (body.version, strata_key),
-                )
-                return _serialize(cur.fetchone()), False
+                return _serialize(_find_by_key(cur, body.version, strata_key)), False
 
     return (
         _serialize(

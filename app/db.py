@@ -50,6 +50,9 @@ CREATE TABLE IF NOT EXISTS snapshots (
     revision   INTEGER NOT NULL,
     label      TEXT,
     assertions JSONB NOT NULL,
+    -- 定版成员清单：封存时刻全部已登记地层（按编号排序），新定版恒写入（可为空数组）；
+    -- NULL 仅见于本列引入前的既有定版，其成员身份只按定版自身封存的历史记录判定
+    members    JSONB,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
@@ -285,6 +288,13 @@ ALTER TABLE field_packages ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT
     CHECK (status IN ('active', 'superseded'));
 ALTER TABLE field_packages ADD COLUMN IF NOT EXISTS superseded_by_package_no TEXT;
 ALTER TABLE field_packages ADD COLUMN IF NOT EXISTS superseded_at TIMESTAMPTZ;
+"""
+
+# 老库 snapshots 补定版成员清单列（全新库的 CREATE 已包含，ADD IF NOT EXISTS 幂等）。
+# 既有定版该列保持 NULL：成员身份只按定版自身封存的冻结断言 / 冻结结论证实，
+# 无法证实的地层按“不可判定”明确拒绝，不回填、不伪造成员清单。
+SCHEMA += """
+ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS members JSONB;
 """
 
 _pool: "psycopg2.pool.ThreadedConnectionPool | None" = None

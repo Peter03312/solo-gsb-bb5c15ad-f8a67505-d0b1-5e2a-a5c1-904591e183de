@@ -4,6 +4,7 @@ from typing import Any, Dict, List, Optional
 from psycopg2.extras import Json
 
 from .db import db_conn
+from . import snapshot_members
 from .changes import insert_revision_changes, relation_diffs
 from .derivation import Assertion, Derivation, RELATION_LABELS
 from .errors import ApiError
@@ -227,7 +228,12 @@ def query_relationship(a: str, b: str) -> Dict[str, Any]:
 
 # ------------------------------------------------------------------ 定版
 def create_snapshot(label: Optional[str]) -> Dict[str, Any]:
-    """定版：把当前修订号下全部可确定的关系结论固化为不可变快照。"""
+    """定版：把当前修订号下全部可确定的关系结论固化为不可变快照。
+
+    除冻结生效断言副本与确定关系结论外，同时把**当时全部已登记地层**冻结为
+    成员清单（snapshots.members）：之后新登记的地层不属于本版，历史关系查询
+    与成果包封存只接受版内成员，版外地层明确拒绝，不与版内真实未定混淆。
+    """
     with db_conn() as conn:
         with conn.cursor() as cur:
             # 锁定修订计数器，保证快照与某一修订严格对应
@@ -239,7 +245,7 @@ def create_snapshot(label: Optional[str]) -> Dict[str, Any]:
             derivation = Derivation(active)
 
             cur.execute(
-                "INSERT INTO snapshots (revision, label, assertions) VALUES (%s, %s, %s) RETURNING version",
+                "INSERT INTO snapshots (revision, label, assertions, members) VALUES (%s, %s, %s, %s) RETURNING version",
                 (
                     revision,
                     label,
@@ -249,6 +255,7 @@ def create_snapshot(label: Optional[str]) -> Dict[str, Any]:
                             for x in active
                         ]
                     ),
+                    Json(strata),
                 ),
             )
             version = cur.fetchone()[0]
@@ -267,14 +274,19 @@ def create_snapshot(label: Optional[str]) -> Dict[str, Any]:
                         (version, x, y, relation, Json(path)),
                     )
                     determined += 1
-            return {"version": version, "revision": revision, "conclusions": determined}
+            return {
+                "version": version,
+                "revision": revision,
+                "conclusions": determined,
+                "members": len(strata),
+            }
 
 
 def get_snapshot(version: int) -> Dict[str, Any]:
     with db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT version, revision, label, assertions, created_at FROM snapshots WHERE version = %s",
+                "SELECT version, revision, label, assertions, members, created_at FROM snapshots WHERE version = %s",
                 (version,),
             )
             row = cur.fetchone()
@@ -285,7 +297,10 @@ def get_snapshot(version: int) -> Dict[str, Any]:
                 "revision": row[1],
                 "label": row[2],
                 "assertions": row[3],
-                "created_at": row[4].isoformat(),
+                # 定版成员清单（封存时刻全部已登记地层，按编号排序）；
+                # 既有定版无成员清单时为 null，成员身份按封存记录判定（见关系查询）
+                "members": None if row[4] is None else list(row[4]),
+                "created_at": row[5].isoformat(),
             }
 
 
@@ -297,16 +312,31 @@ def query_snapshot_relationship(version: int, a: str, b: str) -> Dict[str, Any]:
     不读在线断言表：后续正式批次、野外包勘误或推演并入撤回证据后，历史定版的
     结论、路径与每步明细（含 status）保持封存时口径不变；当前正式关系查询
     （GET /relationship）仍显示现时状态。只读，不写断言或修订。
+
+    成员时点一致性：只接受该定版的成员地层。定版后新登记的地层不在成员清单内，
+    按 400 STRATUM_NOT_IN_VERSION 明确拒绝，不与版内真实未定混淆；缺少成员清单
+    的既有定版只在冻结断言 / 冻结结论足以证实时认定成员，无法证实时按
+    409 SNAPSHOT_MEMBERSHIP_UNDETERMINABLE 明确拒绝，不伪造关系。
     """
     with db_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT revision, assertions FROM snapshots WHERE version = %s", (version,))
+            cur.execute(
+                "SELECT revision, assertions, members FROM snapshots WHERE version = %s",
+                (version,),
+            )
             row = cur.fetchone()
             if row is None:
                 raise ApiError(404, "SNAPSHOT_NOT_FOUND", f"版本不存在: {version}", {"version": version})
             snapshot_revision = row[0]
-            frozen_by_id = {x["evidence_id"]: x for x in row[1]}
+            frozen = list(row[1])
+            members = None if row[2] is None else set(row[2])
+            frozen_by_id = {x["evidence_id"]: x for x in frozen}
             _ensure_strata(cur, a, b)
+
+            # 成员校验：版外地层 / 既有定版不可证实的地层明确拒绝（先于结论查询）
+            assertion_strata = snapshot_members.frozen_assertion_strata(frozen)
+            for s in dict.fromkeys((a, b)):
+                snapshot_members.ensure_member(cur, version, members, assertion_strata, s)
 
             if a == b:
                 relation, path = "same_period", []

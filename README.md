@@ -26,15 +26,22 @@
   路径选取规则（证据数最少、并列按证据编号序列字典序最小）均不变；**已关闭推演
   （merged/discarded）仍可查询其冻结视图**。
 - **定版（快照）**：保存当前修订号下全部关系结论的不可变快照；后续撤回不影响旧版结论。
-  历史定版关系查询（`GET /snapshots/{version}/relationship`）的结论、最优证据路径与
+  定版除冻结生效断言副本与确定关系结论外，同时把**当时全部已登记地层**冻结为成员清单
+  （`snapshots.members`，定版详情 `GET /snapshots/{version}` 可见）：历史定版关系查询
+  （`GET /snapshots/{version}/relationship`）与成果包封存（`POST /packages`）只接受
+  **该版成员**；定版后新登记的地层属于版外，按 400 `STRATUM_NOT_IN_VERSION` 明确拒绝，
+  不与版内真实“未定”混淆。缺少成员清单的**既有定版**（成员清单列引入前封存，
+  `members=null`）只在其**冻结断言副本 / 冻结结论**足以证实时认定成员，无法证实时按
+  409 `SNAPSHOT_MEMBERSHIP_UNDETERMINABLE` 明确拒绝，不伪造关系；已封成果包内容、
+  版内结论与证据路径保持原样。历史定版关系查询的结论、最优证据路径与
   逐步证据明细 `path_detail` 均按**封存时**口径返回：明细取自定版冻结的断言副本
   （`snapshots.assertions`，与同期封存的成果包证据明细同一来源），不读在线断言表，
   因此后续正式批次、野外包勘误或推演并入撤回路径上的证据后，历史明细（含每步
   `status`）保持封存时的 `active` 不变；当前正式关系查询继续显示现时状态。
-- **专题成果包**：把某定版中的一组（≥2、不重复、已登记）地层封存为不可变、可转交
-  复核包：只含按编号排序的无序两两关系，结论与最优路径同该定版查询，确定结论携带
-  路径按序原始断言，途经未入选地层随证据保留但不扩展关系，未定不附路径；同一定版 +
-  同一地层集合（顺序无关）只封存一份，撤回 / 新修订 / 新定版均不改变包内容。
+- **专题成果包**：把某定版中的一组（≥2、不重复、已登记且为**该定版成员**）地层封存为
+  不可变、可转交复核包：只含按编号排序的无序两两关系，结论与最优路径同该定版查询，
+  确定结论携带路径按序原始断言，途经未入选地层随证据保留但不扩展关系，未定不附路径；
+  同一定版 + 同一地层集合（顺序无关）只封存一份，撤回 / 新修订 / 新定版均不改变包内容。
 - **修订变化追踪**：对每次成功的正式断言批次及推演并入产生的正式修订，记录提交前后
   关系结论或最优支撑路径发生变化的地层对；同一对按地层编号固定顺序只列一次；
   关系不变但最优路径改变也记录；变为未定时路径为空。记录与批次同事务原子写入，
@@ -295,16 +302,16 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | GET | `/periodization?expected_revision=1` | 只读分期骨架：同一期等价组 + 组间传递约简后的直接早于边（含孤立地层） |
 | POST | `/periodization/arrangement` | 正式视图只读分期试排：总期数 1～64 + 期位锚点，返回每组在所有可行排布中的最早/最晚期位 |
 | POST | `/projections/{id}/periodization/arrangement` | 推演冻结视图（含已关闭）只读分期试排，返回结构同正式 |
-| POST | `/snapshots` | 定版：保存不可变关系快照 `{label?}` |
-| GET | `/snapshots` / `/snapshots/{version}` | 版本列表 / 版本详情 |
-| GET | `/snapshots/{version}/relationship?a=L1&b=L3` | 查询历史版本结论（结论 / 最优路径 / 逐步明细均按封存时冻结口径，与同一定版封存的成果包明细一致） |
+| POST | `/snapshots` | 定版：保存不可变关系快照 `{label?}`（同时冻结当时全部已登记地层为成员清单） |
+| GET | `/snapshots` / `/snapshots/{version}` | 版本列表 / 版本详情（含冻结断言副本与成员清单 `members`，既有定版为 null） |
+| GET | `/snapshots/{version}/relationship?a=L1&b=L3` | 查询历史版本结论（结论 / 最优路径 / 逐步明细均按封存时冻结口径，与同一定版封存的成果包明细一致；只接受该版成员，版外 400 `STRATUM_NOT_IN_VERSION`，既有定版不可判定 409 `SNAPSHOT_MEMBERSHIP_UNDETERMINABLE`） |
 | POST | `/projections` | 创建推演（固定当前修订号、地层与生效断言） `{label?}` |
 | GET | `/projections` / `/projections/{id}` | 推演列表 / 推演详情（含净变更） |
 | POST | `/projections/{id}/batches` | 推演内提交批次（携带推演修订号，语义同正式批次） |
 | GET | `/projections/{id}/relationship?a=L1&b=L3` | 查询推演视角下的关系与证据路径 |
 | POST | `/projections/{id}/merge` | 并入：净变更应用于最新正式状态并重新核验 |
 | DELETE | `/projections/{id}` | 放弃推演（仅 open 可放弃） |
-| POST | `/packages` | 封存专题成果包：把定版中的一组地层关系冻结为可转交复核包 `{version, strata[]}` |
+| POST | `/packages` | 封存专题成果包：把定版中的一组地层关系冻结为可转交复核包 `{version, strata[]}`（入选地层须全部为该定版成员） |
 | POST | `/packages/{id}/reconcile` | 成果包交付前只读复核：逐对比较封存关系/最优路径与当前结果（结论改变/仅路径改变/完全一致），附首次偏离修订号与来源 |
 | GET | `/packages` / `/packages/{id}` | 成果包列表 / 成果包详情（冻结内容与内容指纹） |
 
@@ -775,6 +782,81 @@ curl "$BASE/packages/1"
 bash examples/snapshot_frozen_detail_demo.sh
 ```
 
+### 定版成员时点一致性：版外地层明确拒绝，既有定版不可判定不伪造
+
+定版除封存断言与关系结论外，同时把**当时全部已登记地层**冻结为成员清单
+（`snapshots.members`）：历史定版关系查询与成果包封存只接受**该版成员**。
+修复前，定版后新登记的地层用旧版查询 / 封包时会被误当作旧版的“未定”成员
+（按当前地层表校验通过、又查不到结论行）；修复后：
+
+- **新定版**（自带成员清单）：版外地层（定版封存后才登记）明确拒绝
+  **400 `STRATUM_NOT_IN_VERSION`**，与版内真实“未定”（200 `undetermined`）严格区分；
+- **既有定版**（成员清单列引入前封存，`members=null`）：只用定版自身封存的历史
+  记录证实成员身份——地层出现在**冻结断言副本**（`snapshots.assertions`）或
+  **冻结结论**（`snapshot_conclusions`）中即证实为成员（封存时刻必然已登记）；
+  两处都不出现的地层**无法证实**（可能是当时已登记但无断言留痕的孤立地层，也可能
+  是定版后才登记的新地层），按 **409 `SNAPSHOT_MEMBERSHIP_UNDETERMINABLE`** 明确
+  拒绝，**不伪造关系**；
+- **已封成果包内容、版内结论与证据路径保持原样**：既有定版下已封存的包照常可读，
+  同定版 + 同集合的重复封存仍幂等返回原包（HTTP 200，`already_exists=true`）；
+- 未登记地层仍 400 `INVALID_STRATUM`、未知定版仍 404 `SNAPSHOT_NOT_FOUND`；
+  当前正式关系查询 `GET /relationship` 不受定版成员约束，继续显示现时状态。
+
+```bash
+# 1) 登记 M1/M2、提交断言并定版 v1（v1 成员 = {M1, M2}）
+curl -X POST "$BASE/strata" -H 'Content-Type: application/json' -d '{"stratum_id": "M1", "site": "甲遗址"}'
+curl -X POST "$BASE/strata" -H 'Content-Type: application/json' -d '{"stratum_id": "M2", "site": "甲遗址"}'
+curl -X POST "$BASE/batches" -H 'Content-Type: application/json' -d '{
+  "expected_revision": 0,
+  "operations": [
+    {"op": "assert", "evidence_id": "EV-M1", "stratum_a": "M1", "stratum_b": "M2", "relation": "earlier_than"}
+  ]}'
+curl -X POST "$BASE/snapshots" -H 'Content-Type: application/json' -d '{"label": "一期定版"}'
+# -> {"version": 1, "revision": 1, "conclusions": 2, "members": 2}
+
+# 定版详情可见冻结成员清单（既有定版为 members=null）
+curl "$BASE/snapshots/1"
+# -> {"version": 1, "revision": 1, "members": ["M1", "M2"], "assertions": [...], ...}
+
+# 2) 定版后登记新地层 M3：用 v1 查询 / 封包涉及 M3 时明确拒绝
+curl -X POST "$BASE/strata" -H 'Content-Type: application/json' -d '{"stratum_id": "M3", "site": "甲遗址"}'
+curl "$BASE/snapshots/1/relationship?a=M1&b=M3"
+# -> HTTP 400 {"error": {"code": "STRATUM_NOT_IN_VERSION",
+#     "message": "地层不在定版 1 的成员清单内（定版封存后才登记）: M3",
+#     "details": {"version": 1, "stratum_id": "M3"}}}
+curl -X POST "$BASE/packages" -H 'Content-Type: application/json' \
+  -d '{"version": 1, "strata": ["M1", "M3"]}'
+# -> HTTP 400 STRATUM_NOT_IN_VERSION（details.stratum_ids 列出全部版外地层）
+
+# 3) 版内成员照常：查询返回封存结论；封包 201，重复封存 200 幂等返回同一份
+curl "$BASE/snapshots/1/relationship?a=M1&b=M2"          # -> 200 earlier_than ...
+curl -X POST "$BASE/packages" -H 'Content-Type: application/json' \
+  -d '{"version": 1, "strata": ["M1", "M2"]}'            # -> 201 {"id": 1, ...}
+
+# 4) 对照：新定版 v2 的成员含 M3，v2 中 M1-M3 无证据 -> 200 undetermined（版内真实未定）
+curl -X POST "$BASE/snapshots" -H 'Content-Type: application/json' -d '{"label": "二期定版"}'
+curl "$BASE/snapshots/2/relationship?a=M1&b=M3"
+# -> {"relation": "undetermined", "evidence_path": null, "path_detail": [], ...}
+
+# 5) 既有定版（members=null）：冻结记录可证实的成员照常查询；
+#    无法证实的地层 -> HTTP 409 SNAPSHOT_MEMBERSHIP_UNDETERMINABLE
+#    {"error": {"code": "SNAPSHOT_MEMBERSHIP_UNDETERMINABLE",
+#     "message": "定版 1 为缺少成员清单的既有定版，其封存记录不足以证实地层 M3 在定版时刻已登记，成员身份不可判定",
+#     "details": {"version": 1, "stratum_id": "M3"}}}
+```
+
+完整端到端演示（新定版冻结成员、版外查询 / 封包拒绝、版内真实未定对照、
+既有定版可证实 / 不可判定、已封包保持原样）：
+
+```bash
+bash examples/snapshot_members_demo.sh
+# 既有定版（members=NULL）演练需可连库的一次性运维命令：
+RUN_LEGACY_SCENARIO=1 PSQL_CMD='docker compose exec -T db psql -U strat -d stratigraphy' \
+  bash examples/snapshot_members_demo.sh
+# 自动化回归（内存假连接，无需数据库）：
+python3 tests/test_snapshot_members.py
+```
+
 ### 证据撤回承受力分析：`POST /resilience/retraction-analysis`（只读）
 
 考古人员核对当前地层关系时，需要知道它对**证据撤回**的承受力：若允许在**同一正式视图**
@@ -1061,6 +1143,8 @@ bash examples/arrangement_demo.sh
 | 409 | `CONFLICT` | 整批核验发现组内早于 / 早于闭环（附冲突证据路径） |
 | 409 | `STRATUM_EXISTS` | 地层重复登记 |
 | 404 | `SNAPSHOT_NOT_FOUND` | 版本不存在 |
+| 400 | `STRATUM_NOT_IN_VERSION` | 地层不在该定版的成员清单内（定版封存后才登记），历史定版查询 / 成果包封存明确拒绝 |
+| 409 | `SNAPSHOT_MEMBERSHIP_UNDETERMINABLE` | 既有定版缺少成员清单，其封存记录不足以证实地层在定版时刻已登记，成员身份不可判定（不伪造关系） |
 | 404 | `PROJECTION_NOT_FOUND` | 推演不存在 |
 | 409 | `PROJECTION_CLOSED` | 推演已关闭（merged/discarded），不可再操作 |
 | 409 | `MERGE_TARGET_RETRACTED` | 并入失败：撤回目标证据已在最新正式状态被撤回 |
@@ -1293,6 +1377,9 @@ bash examples/projection_demo.sh
 **封存口径**
 
 - 请求给出定版编号 `version` 与至少两个、不重复的**已登记**地层编号 `strata`；
+- 入选地层须全部为该定版**成员**（定版封存时刻已登记；成员口径见
+  「定版成员时点一致性」一节）：版外地层 400 `STRATUM_NOT_IN_VERSION`，
+  既有定版无法证实的地层 409 `SNAPSHOT_MEMBERSHIP_UNDETERMINABLE`；
 - 包内只列所选地层**按编号排序**后的无序两两关系（每对取编号较小者为
   `stratum_a`，`stratum_a < stratum_b`）；
 - 关系结论与最优证据路径与**该定版查询**（`GET /snapshots/{version}/relationship`）
@@ -1316,7 +1403,8 @@ bash examples/projection_demo.sh
   成果包（按排序去重后的集合取指纹 `strata_key`，数据库唯一约束
   `(version, strata_key)` 保证；并发封存也在行锁下串行）；
 - 首次封存返回 **HTTP 201**；同集合重复封存幂等返回**同一份**（相同 `id` 与
-  `content_hash`），HTTP **200**，响应带 `already_exists=true`；
+  `content_hash`），HTTP **200**，响应带 `already_exists=true`——已封成果包
+  保持原样，即使其入选集合按现行成员口径已不可新封，重复封存仍返回原包；
 - 包内容在封存事务内一次性冻结，之后**永不修改、永不删除**：正式断言撤回、后续
   修订、新定版都不会改变已有包（旧包仍展示定版当时的结论与当时生效断言）。
 
@@ -1328,6 +1416,8 @@ bash examples/projection_demo.sh
 | 少于两个地层 | 400 | `NOT_ENOUGH_STRATA` |
 | 地层编号重复 | 400 | `DUPLICATE_STRATUM` |
 | 含空编号 / 地层未登记 | 400 | `INVALID_STRATUM` |
+| 地层不在该定版成员清单内（定版后才登记） | 400 | `STRATUM_NOT_IN_VERSION` |
+| 既有定版缺少成员清单且封存记录无法证实 | 409 | `SNAPSHOT_MEMBERSHIP_UNDETERMINABLE` |
 | 定版不存在 | 404 | `SNAPSHOT_NOT_FOUND` |
 | 缺少 `version`/`strata` 字段、类型不符 | 422 | FastAPI 请求体校验 |
 
@@ -1616,12 +1706,13 @@ python3 examples/client_demo.py
 ```
 app/
   main.py         # FastAPI 路由与错误处理
-  service.py      # 正式批次核验、关系查询（只读快照同视图）、定版快照
+  service.py      # 正式批次核验、关系查询（只读快照同视图）、定版快照（冻结成员清单）
+  snapshot_members.py # 定版成员时点一致性：版内 / 版外 / 不可判定判定与明确拒绝
   field.py        # 野外终端离线整包汇入与勘误替换：短号建层/跨包绑定、稳定证据编号、整批核验、包台账幂等、撤回替换链
   holds.py        # 争议证据临时保全：一次性解除凭据（哈希存证）、生效保全来源查询、正式撤回三路径拦截与预检只读拦截、行锁同序裁决
   preflight.py    # 提交前只读预检：求消除本批冲突所需撤回的最少生效旧证据（预算 0～3；受保全证据不进建议，直接撤回按 EVIDENCE_HELD 拒绝）
   resilience.py   # 证据撤回承受力（只读）：混合证据图最小割求让两层关系变未定的最少撤回（含受保护集合）
-  packages.py     # 专题成果包：定版地层关系封存（冻结、集合幂等、不可变、可转交复核）
+  packages.py     # 专题成果包：定版地层关系封存（冻结、集合幂等、不可变、可转交复核；只接受版内成员）
   reconciliation.py # 成果包交付前只读复核：封存结论/最优路径与当前结果逐项比较、首次偏离追溯
   projections.py  # 推演（沙盘）：创建固定基线、推演批次、关系查询（冻结快照同视图）、并入核验
   periodization.py # 分期骨架视图（只读）：同一期等价组、组间传递约简直接早于边
@@ -1634,6 +1725,7 @@ examples/
   demo.sh           # curl 端到端示例（批次/查询/冲突/撤回/定版）
   relationship_view_demo.sh # 两类关系查询同视图示例（并发提交不混版/推演冻结视图/已关闭可查/错误约定）
   snapshot_frozen_detail_demo.sh # 历史定版查询冻结明细示例（三类撤回来源后明细不变/成果包逐步比对/错误约定）
+  snapshot_members_demo.sh # 定版成员时点一致性示例（新定版冻结成员/版外拒绝/版内真实未定对照/既有定版不可判定/已封包原样）
   periodization_demo.sh # 分期骨架视图示例（等价组/平行合并/传递省略/过期拒绝/撤回重算）
   arrangement_demo.sh # 分期试排示例（最早/最晚界、锚点、三类不可行证据链、推演冻结视图）
   preflight_demo.sh # 提交前只读预检示例（最少撤回/预算不足/新断言自相矛盾/拒绝/保全联动：EVIDENCE_HELD 与建议排除受保全证据/只读校验）
@@ -1654,6 +1746,7 @@ tests/
   test_relationship_view_consistency.py # 两类关系查询同视图回归（内存假连接：注入并发提交，断言修订号/结论/路径明细不混版）
   test_relationship_view_consistency_e2e.py # 同上的真实 PostgreSQL 端到端验证（语句门闩确定性交错 + 多线程压力）
   test_snapshot_relationship_frozen_detail.py # 历史定版查询冻结明细回归（内存假连接：撤回后明细保持封存口径/与成果包同源/正式查询仍现态）
+  test_snapshot_members.py           # 定版成员时点一致性回归（内存假连接：新定版冻结成员/版外拒绝/既有定版可证实与不可判定/已封包幂等原样）
   bench_relation_diffs.py            # 大量无关地层 + 局部变更性能基准（纯函数）
 Dockerfile
 docker-compose.yml

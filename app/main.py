@@ -19,12 +19,18 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="考古地层关系核验服务",
-    version="1.14.0",
+    version="1.15.0",
     description=(
         "登记遗址地层与带唯一证据编号的“同一期 / 早于”断言；"
         "同一期可传递，早于沿同一期与早于路径推导；"
         "批次携带修订号、按整批最终关系核验，矛盾整批拒绝；"
         "支持关系查询（含支撑证据路径）与不可变定版快照；"
+        "定版除封存断言与关系结论外，同时冻结当时全部已登记地层（成员清单）："
+        "历史定版关系查询与成果包封存只接受该版成员，版外地层明确拒绝"
+        "（400 STRATUM_NOT_IN_VERSION），不与版内真实未定混淆；"
+        "缺少成员清单的既有定版只在其冻结断言 / 冻结结论足以证实时认定成员，"
+        "无法证实时明确拒绝（409 SNAPSHOT_MEMBERSHIP_UNDETERMINABLE），不伪造关系；"
+        "已封成果包内容、版内结论与证据路径保持原样；"
         "正式关系查询（GET /relationship）与推演关系查询"
         "（GET /projections/{id}/relationship）均在同一只读快照视图内完成，"
         "一次响应的修订号 / 推演状态、关系结论、最优证据路径与逐步证据明细不混版："
@@ -473,7 +479,13 @@ def get_revision_changes(
 # ------------------------------------------------------------------ 定版
 @app.post("/snapshots", status_code=201, tags=["snapshots"])
 def post_snapshot(body: SnapshotIn):
-    """定版：保存当前修订号下全部关系结论的不可变快照。"""
+    """定版：保存当前修订号下全部关系结论的不可变快照。
+
+    除冻结生效断言副本与确定关系结论外，同时把**当时全部已登记地层**冻结为
+    成员清单 `members`（响应返回成员数；完整清单见 GET /snapshots/{version}）：
+    之后新登记的地层不属于本版，用本版查询或封包时会被明确拒绝，不会被误当作
+    本版的“未定”成员。
+    """
     return service.create_snapshot(body.label)
 
 @app.get("/snapshots", tags=["snapshots"])
@@ -489,6 +501,12 @@ def list_snapshots():
 
 @app.get("/snapshots/{version}", tags=["snapshots"])
 def get_snapshot(version: int):
+    """定版详情：修订号、冻结断言副本与成员清单 `members`。
+
+    `members` 为封存时刻全部已登记地层（按编号排序）；缺少成员清单的既有定版
+    返回 `members=null`，其成员身份在关系查询 / 成果包封存时按定版自身封存的
+    冻结断言与冻结结论判定。
+    """
     return service.get_snapshot(version)
 
 
@@ -503,6 +521,11 @@ def get_snapshot_relationship(version: int, a: str = Query(...), b: str = Query(
     GET /relationship 仍显示现时状态。定版不存在 404 SNAPSHOT_NOT_FOUND、
     地层未登记 400 INVALID_STRATUM；路径优选规则与查询字段不变；只读，不写
     断言或修订。
+
+    成员时点一致性：只接受该定版的成员地层。定版后新登记的地层不在成员清单
+    内，按 400 STRATUM_NOT_IN_VERSION 明确拒绝，不与版内真实“未定”混淆；
+    缺少成员清单的既有定版只在其冻结断言 / 冻结结论足以证实时认定成员，
+    无法证实时按 409 SNAPSHOT_MEMBERSHIP_UNDETERMINABLE 明确拒绝，不伪造关系。
     """
     return service.query_snapshot_relationship(version, a, b)
 
@@ -515,8 +538,11 @@ def post_package(body: PackageIn):
     - 只含所选地层按编号排序的无序两两关系，结论与最优证据路径与该定版查询一致；
     - 确定结论携带路径上按序的原始断言；路径途经未入选地层随证据保留
       （`transit_strata` / 逐步 `in_selection`），不扩展额外关系；未定关系不附路径；
+    - 入选地层须全部为该定版成员（定版封存时刻已登记）：版外地层
+      400 STRATUM_NOT_IN_VERSION；缺少成员清单的既有定版无法证实的地层
+      409 SNAPSHOT_MEMBERSHIP_UNDETERMINABLE，均不伪造“未定”关系行；
     - 同一定版 + 同一地层集合（顺序无关）只生成一份：重复封存返回同一份
-      （`already_exists=true`，HTTP 200），首次封存 HTTP 201；
+      （`already_exists=true`，HTTP 200，已封内容保持原样），首次封存 HTTP 201；
     - 包内容封存即冻结，撤回、新修订、新定版均不改变。
     """
     payload, created = packages_svc.create_package(body)

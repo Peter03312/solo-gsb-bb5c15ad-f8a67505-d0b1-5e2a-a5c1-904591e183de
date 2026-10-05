@@ -90,16 +90,30 @@ class FakeCursor:
             raise AssertionError(f"定版查询不得读取在线断言表: {sql}")
 
         # ---- 定版关系查询路径 ----
-        if norm == "SELECT REVISION, ASSERTIONS FROM SNAPSHOTS WHERE VERSION = %S":
-            snap = self.conn.live["snapshots"].get(params[0])
-            self._rows = [] if snap is None else [(snap["revision"], snap["assertions"])]
-        elif norm == "SELECT REVISION, LABEL, ASSERTIONS FROM SNAPSHOTS WHERE VERSION = %S":
+        if norm == "SELECT REVISION, ASSERTIONS, MEMBERS FROM SNAPSHOTS WHERE VERSION = %S":
             snap = self.conn.live["snapshots"].get(params[0])
             self._rows = (
-                [] if snap is None else [(snap["revision"], snap["label"], snap["assertions"])]
+                []
+                if snap is None
+                else [(snap["revision"], snap["assertions"], snap.get("members"))]
+            )
+        elif norm == "SELECT REVISION, LABEL, ASSERTIONS, MEMBERS FROM SNAPSHOTS WHERE VERSION = %S":
+            snap = self.conn.live["snapshots"].get(params[0])
+            self._rows = (
+                []
+                if snap is None
+                else [(snap["revision"], snap["label"], snap["assertions"], snap.get("members"))]
             )
         elif norm == "SELECT 1 FROM STRATA WHERE STRATUM_ID = %S":
             self._rows = [(1,)] if params[0] in self.conn.live["strata"] else []
+        elif norm.startswith("SELECT 1 FROM SNAPSHOT_CONCLUSIONS"):
+            # 既有定版成员证实：该版冻结结论中是否出现指定地层
+            version, stratum_id = params[0], params[1]
+            hit = any(
+                v == version and stratum_id in (a, b)
+                for (v, a, b) in self.conn.live["snapshot_conclusions"]
+            )
+            self._rows = [(1,)] if hit else []
         elif norm.startswith("SELECT RELATION, PATH FROM SNAPSHOT_CONCLUSIONS"):
             key = (params[0], params[1], params[2])
             conclusion = self.conn.live["snapshot_conclusions"].get(key)
@@ -209,7 +223,9 @@ def sealed_state():
             "EV-003": ("L3", "L4", "earlier_than", "retracted"),
         },
         "snapshots": {
-            1: {"revision": 2, "label": "二期定版", "assertions": FROZEN_ASSERTIONS},
+            # members=None：模拟成员清单列引入前封存的既有定版；L1~L4 均出现在
+            # 冻结断言副本中，成员身份可被封存记录证实，查询行为与修复前一致。
+            1: {"revision": 2, "label": "二期定版", "assertions": FROZEN_ASSERTIONS, "members": None},
         },
         "snapshot_conclusions": {
             (1, "L1", "L2"): ("same_period", ["EV-001"]),
@@ -249,7 +265,7 @@ def test_snapshot_detail_frozen_after_retractions():
 def test_snapshot_detail_matches_package_frozen_source():
     """定版查询明细与成果包证据明细同一冻结来源：逐步一致。"""
     state = sealed_state()
-    _, _, frozen_by_id = load_package_frozen(state, 1)  # 成果包封存的真实加载器
+    _, _, frozen_by_id, _members = load_package_frozen(state, 1)  # 成果包封存的真实加载器
 
     resp = run_snapshot(state, 1, "L1", "L4")
     expected = [
