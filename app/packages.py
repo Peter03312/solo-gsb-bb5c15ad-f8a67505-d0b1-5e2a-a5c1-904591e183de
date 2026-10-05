@@ -28,6 +28,7 @@ from .db import db_conn
 from .derivation import RELATION_LABELS
 from .errors import ApiError
 from .models import PackageIn
+from .service import _assert_snapshot_members
 
 
 # ------------------------------------------------------------------ 工具
@@ -80,17 +81,29 @@ def _validate_strata(raw: Sequence[str]) -> List[str]:
     return sorted(seen)
 
 
-def _load_snapshot(cur, version: int) -> Tuple[int, Optional[str], Dict[str, Dict[str, Any]]]:
+def _load_snapshot(cur, version: int) -> Tuple[int, Optional[str], Dict[str, Dict[str, Any]], str, Set[str]]:
     """读取定版及其冻结断言副本。定版不存在明确拒绝。
 
-    返回 (定版修订号, 定版备注, 以证据编号为键的冻结原始断言)。
+    返回 (定版修订号, 定版备注, 以证据编号为键的冻结原始断言, 成员清单状态,
+    成员清单)。成员清单状态 frozen=定版时完整冻结全部已登记地层；
+    reconstructed=对无清单既有定版按历史记录重建的可证实成员。
     冻结断言固定带 status=active（定版保存的就是当时生效断言，后续撤回不改变包）。
     """
-    cur.execute("SELECT revision, label, assertions FROM snapshots WHERE version = %s", (version,))
+    cur.execute(
+        "SELECT revision, label, assertions, membership_status, strata "
+        "FROM snapshots WHERE version = %s",
+        (version,),
+    )
     row = cur.fetchone()
     if row is None:
         raise ApiError(404, "SNAPSHOT_NOT_FOUND", f"定版不存在: {version}", {"version": version})
-    revision, label, raw_assertions = row[0], row[1], list(row[2])
+    revision, label, raw_assertions, membership_status, strata_list = (
+        row[0],
+        row[1],
+        list(row[2]),
+        row[3],
+        set(row[4] or []),
+    )
     by_id: Dict[str, Dict[str, Any]] = {}
     for a in raw_assertions:
         by_id[a["evidence_id"]] = {
@@ -100,7 +113,7 @@ def _load_snapshot(cur, version: int) -> Tuple[int, Optional[str], Dict[str, Dic
             "relation": a["relation"],
             "status": "active",
         }
-    return revision, label, by_id
+    return revision, label, by_id, membership_status, strata_list
 
 
 def _ensure_registered(cur, strata: Sequence[str]) -> None:
@@ -192,10 +205,29 @@ def create_package(body: PackageIn) -> Tuple[Dict[str, Any], bool]:
 
     with db_conn() as conn:
         with conn.cursor() as cur:
-            revision, label, frozen_assertions = _load_snapshot(cur, body.version)
+            revision, label, frozen_assertions, _membership_status, _snapshot_members = _load_snapshot(
+                cur, body.version
+            )
             _ensure_registered(cur, selected)
 
             strata_key = _strata_key(body.version, selected)
+
+            # 已封存内容优先：同一定版 + 同一集合的包只此一份，封存即冻结、永不重算。
+            # 即便本次请求的成员门本不会通过（如在既有定版上重复请求已封过的集合），
+            # 也原样返回已封包——已封成果包内容保持原样，不因新口径被改写或拒绝。
+            cur.execute(
+                f"SELECT {_SELECT_COLUMNS} FROM thematic_packages "
+                "WHERE version = %s AND strata_key = %s",
+                (body.version, strata_key),
+            )
+            existing = cur.fetchone()
+            if existing is not None:
+                return _serialize(existing), False
+
+            # 新封存：统一成员门——只接受该版成员；版外（frozen 版）或不可判定
+            # （reconstructed 既有版）明确拒绝，绝不把版外地层当成旧版“未定”成员封入。
+            _assert_snapshot_members(cur, body.version, *selected)
+
             pairs, evidence, transit = _build_pairs(cur, body.version, selected, frozen_assertions)
             content_hash = hashlib.sha256(
                 _canonical(
@@ -210,8 +242,8 @@ def create_package(body: PackageIn) -> Tuple[Dict[str, Any], bool]:
                 ).encode("utf-8")
             ).hexdigest()
 
-            # 唯一索引层串行化：首封写入并取回 id；并发/重复同集合取不到行，
-            # 随后读取已提交的同一份包。
+            # 唯一索引层串行化：首封写入并取回 id；并发同集合取不到行，随后读取
+            # 已提交的同一份包。
             cur.execute(
                 "INSERT INTO thematic_packages "
                 "(version, revision, label, strata, strata_key, pairs, evidence, transit_strata, content_hash) "
@@ -233,7 +265,7 @@ def create_package(body: PackageIn) -> Tuple[Dict[str, Any], bool]:
             inserted = cur.fetchone()
 
             if inserted is None:
-                # 同集合已被（可能在并发事务中）封存：读取那一份冻结内容
+                # 同集合在并发事务中先一步封存：读取那一份冻结内容
                 cur.execute(
                     f"SELECT {_SELECT_COLUMNS} FROM thematic_packages "
                     "WHERE version = %s AND strata_key = %s",

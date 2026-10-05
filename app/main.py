@@ -19,7 +19,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="考古地层关系核验服务",
-    version="1.14.0",
+    version="1.15.0",
     description=(
         "登记遗址地层与带唯一证据编号的“同一期 / 早于”断言；"
         "同一期可传递，早于沿同一期与早于路径推导；"
@@ -52,6 +52,14 @@ app = FastAPI(
         "变化计算先按提交前后生效断言定位可能改变结论或最优路径的候选地层对"
         "（同期合并拆分、早于路径改道全覆盖）再精算，局部变更不再逐对重算全库；"
         "支持把定版中的一组地层封存为不可变、可转交复核的专题成果包（/packages）；"
+        "定版成员时点一致：新定版冻结当时全部已登记地层（membership_status=frozen），"
+        "旧版关系查询（GET /snapshots/{v}/relationship）与成果包封存（POST /packages）"
+        "只接受该版成员——定版之后才登记的地层返回 400 STRATUM_OUTSIDE_VERSION，"
+        "明确与版内真实未定（版内成员无冻结结论行）区分；对缺少成员清单的既有定版，"
+        "启动时按该版冻结断言端点与冻结结论行重建可证实成员（membership_status=reconstructed，"
+        "可在 GET /snapshots/{v} 查看 strata 与 membership_status），无法由历史记录证实"
+        "成员归属的地层返回 409 SNAPSHOT_MEMBERSHIP_UNDECIDABLE（附 provable_members），"
+        "不可判定而非伪造关系；已封存成果包内容、版内结论与证据路径保持原样；"
         "支持成果包交付前只读复核（POST /packages/{id}/reconcile）："
         "在同一只读快照视图中逐项比较包内封存关系结论与最优证据路径和当前正式结果"
         "（结论改变 / 仅路径改变 / 完全一致），并给出每对自封存修订后首次偏离的"
@@ -473,16 +481,33 @@ def get_revision_changes(
 # ------------------------------------------------------------------ 定版
 @app.post("/snapshots", status_code=201, tags=["snapshots"])
 def post_snapshot(body: SnapshotIn):
-    """定版：保存当前修订号下全部关系结论的不可变快照。"""
+    """定版：保存当前修订号下全部关系结论的不可变快照。
+
+    同时冻结定版时点**全部已登记地层**的成员清单（membership_status=frozen）：
+    旧版关系查询与成果包封存只接受该版成员，定版之后才登记的地层按版外明确拒绝
+    （400 STRATUM_OUTSIDE_VERSION），不与版内真实未定混淆；既有无清单定版按
+    历史记录重建可证实成员（membership_status=reconstructed），无法证实时返回
+    409 SNAPSHOT_MEMBERSHIP_UNDECIDABLE，不伪造关系。
+    """
     return service.create_snapshot(body.label)
 
 @app.get("/snapshots", tags=["snapshots"])
 def list_snapshots():
     with db.db_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT version, revision, label, created_at FROM snapshots ORDER BY version")
+            cur.execute(
+                "SELECT version, revision, label, membership_status, strata, created_at "
+                "FROM snapshots ORDER BY version"
+            )
             return [
-                {"version": r[0], "revision": r[1], "label": r[2], "created_at": r[3].isoformat()}
+                {
+                    "version": r[0],
+                    "revision": r[1],
+                    "label": r[2],
+                    "membership_status": r[3],
+                    "members": len(r[4] or []),
+                    "created_at": r[5].isoformat(),
+                }
                 for r in cur.fetchall()
             ]
 
@@ -496,13 +521,18 @@ def get_snapshot(version: int):
 def get_snapshot_relationship(version: int, a: str = Query(...), b: str = Query(...)):
     """查询历史版本结论；后续撤回不影响旧版结论与逐步证据明细。
 
+    成员时点一致：只接受该版成员，版外明确拒绝、不与版内真实未定混淆——
+    定版后才登记的地层（frozen 版）返回 400 STRATUM_OUTSIDE_VERSION；
+    无成员清单的既有定版（reconstructed）对历史记录无法证实归属的地层返回
+    409 SNAPSHOT_MEMBERSHIP_UNDECIDABLE（details 附 provable_members）；
+    当前未登记仍 400 INVALID_STRATUM。版内成员无冻结结论行才是该版真实未定。
+
     关系结论与最优证据路径取自该定版的冻结结论，逐步明细 path_detail 按定版
     冻结的断言副本逐步展开（与同期封存的成果包证据明细同一来源、完全一致，
     各步 status 恒为封存时的 active）：定版之后的正式批次、野外包勘误或推演
     并入撤回路径上的证据，本查询的响应保持封存时口径不变；当前正式关系查询
-    GET /relationship 仍显示现时状态。定版不存在 404 SNAPSHOT_NOT_FOUND、
-    地层未登记 400 INVALID_STRATUM；路径优选规则与查询字段不变；只读，不写
-    断言或修订。
+    GET /relationship 仍显示现时状态。定版不存在 404 SNAPSHOT_NOT_FOUND；
+    路径优选规则与查询字段不变；只读，不写断言或修订。
     """
     return service.query_snapshot_relationship(version, a, b)
 
@@ -512,11 +542,16 @@ def get_snapshot_relationship(version: int, a: str = Query(...), b: str = Query(
 def post_package(body: PackageIn):
     """把某定版中的一组地层封存为不可变专题成果包（可转交复核）。
 
+    - 成员时点一致：只接受该定版成员。定版后才登记的地层对 frozen 版返回
+      400 STRATUM_OUTSIDE_VERSION；无成员清单的既有定版（reconstructed）对
+      无法证实归属的地层返回 409 SNAPSHOT_MEMBERSHIP_UNDECIDABLE——版外
+      地层不会被当成旧版“未定”成员封入；当前未登记仍 400 INVALID_STRATUM；
     - 只含所选地层按编号排序的无序两两关系，结论与最优证据路径与该定版查询一致；
-    - 确定结论携带路径上按序的原始断言；路径途经未入选地层随证据保留
+      确定结论携带路径上按序的原始断言；路径途经未入选地层随证据保留
       （`transit_strata` / 逐步 `in_selection`），不扩展额外关系；未定关系不附路径；
     - 同一定版 + 同一地层集合（顺序无关）只生成一份：重复封存返回同一份
-      （`already_exists=true`，HTTP 200），首次封存 HTTP 201；
+      （`already_exists=true`，HTTP 200），已封内容原样返回、不重算不改写，
+      首次封存 HTTP 201；
     - 包内容封存即冻结，撤回、新修订、新定版均不改变。
     """
     payload, created = packages_svc.create_package(body)

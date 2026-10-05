@@ -1,5 +1,5 @@
 """业务逻辑：批次应用、关系查询、定版快照。"""
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from psycopg2.extras import Json
 
@@ -225,9 +225,117 @@ def query_relationship(a: str, b: str) -> Dict[str, Any]:
             return payload
 
 
+# ------------------------------------------------------------------ 定版成员
+def _snapshot_membership(cur, version: int) -> Tuple[str, Set[str]]:
+    """读取定版的成员清单与清单状态（frozen 完整冻结 / reconstructed 历史重建）。
+
+    定版不存在抛 SNAPSHOT_NOT_FOUND。
+    """
+    cur.execute(
+        "SELECT membership_status, strata FROM snapshots WHERE version = %s",
+        (version,),
+    )
+    row = cur.fetchone()
+    if row is None:
+        raise ApiError(404, "SNAPSHOT_NOT_FOUND", f"版本不存在: {version}", {"version": version})
+    return row[0], set(row[1] or [])
+
+
+def _assert_snapshot_members(cur, version: int, *stratum_ids: str) -> None:
+    """旧版关系查询 / 成果包封存的统一成员门：只接受该版成员，版外明确拒绝。
+
+    与“版内真实未定”严格区分：
+    - 地层当前未登记：400 INVALID_STRATUM（与既有错误结构兼容）；
+    - frozen 定版（新口径冻结了当时全部已登记地层）：不在清单即定版之后才登记，
+      返回 400 STRATUM_OUTSIDE_VERSION，details 注明 registered_after_version；
+    - reconstructed 既有定版（无原始清单，只重建出可证实成员）：
+      清单内 → 可证实成员，放行（无结论行即版内真实未定）；
+      清单外但当前已登记 → 历史记录不足以证实其在定版时点是否已登记，
+      返回 409 SNAPSHOT_MEMBERSHIP_UNDECIDABLE，明确说明不可判定，绝不把它
+      当成旧版的“未定”成员，也不伪造任何关系。
+    """
+    status, members = _snapshot_membership(cur, version)
+    for s in stratum_ids:
+        if s in members:
+            continue
+        cur.execute("SELECT 1 FROM strata WHERE stratum_id = %s", (s,))
+        if cur.fetchone() is None:
+            raise ApiError(
+                400, "INVALID_STRATUM", f"地层未登记: {s}", {"stratum_id": s, "version": version}
+            )
+        if status == "frozen":
+            raise ApiError(
+                400,
+                "STRATUM_OUTSIDE_VERSION",
+                f"地层 {s} 在定版 {version} 之后才登记，不属于该版成员，不能按旧版查询或封包",
+                {
+                    "version": version,
+                    "stratum_id": s,
+                    "membership_status": status,
+                    "reason": "registered_after_version",
+                },
+            )
+        raise ApiError(
+            409,
+            "SNAPSHOT_MEMBERSHIP_UNDECIDABLE",
+            (
+                f"定版 {version} 为缺少成员清单的既有定版：历史记录只能证实部分成员，"
+                f"无法证实地层 {s} 在该定版时点是否已登记，成员归属不可判定；"
+                "已证实版内成员的版内关系（含真实未定）照常可查，但不把不可判定地层"
+                "当作旧版成员给出结论或封入成果包"
+            ),
+            {
+                "version": version,
+                "stratum_id": s,
+                "membership_status": status,
+                "provable_members": sorted(members),
+            },
+        )
+
+
+def backfill_snapshot_membership(cur) -> int:
+    """启动时为缺少成员清单的既有定版（迁移后 strata 为 NULL、
+    membership_status=reconstructed）按历史记录重建**可证实**成员清单。
+
+    可证实成员只取自该定版自己封存的、永不变更的历史记录（不看当前在线表）：
+    snapshots.assertions 冻结断言的全部端点 + snapshot_conclusions 冻结结论行的
+    全部端点。这两类记录在 create_snapshot 中只可能引用定版时点已登记地层，因此
+    其中出现的地层必为该版成员；定版时点已登记但没有任何断言 / 结论留痕的孤立
+    地层无法由历史记录证实，保持清单外——成员门对其返回不可判定而非伪造关系。
+    新定版 strata 已完整冻结（membership_status=frozen），本回填不触碰。
+    """
+    cur.execute("SELECT version, assertions FROM snapshots WHERE strata IS NULL ORDER BY version")
+    rows = cur.fetchall()
+    backfilled = 0
+    for version, frozen_assertions in rows:
+        members: Set[str] = set()
+        for a in frozen_assertions or []:
+            members.add(a["stratum_a"])
+            members.add(a["stratum_b"])
+        cur.execute(
+            "SELECT DISTINCT endpoint FROM snapshot_conclusions "
+            "CROSS JOIN LATERAL (VALUES (stratum_a), (stratum_b)) AS t(endpoint) "
+            "WHERE version = %s",
+            (version,),
+        )
+        members.update(r[0] for r in cur.fetchall())
+        cur.execute(
+            "UPDATE snapshots SET strata = %s WHERE version = %s AND strata IS NULL",
+            (Json(sorted(members)), version),
+        )
+        backfilled += 1
+    return backfilled
+
+
 # ------------------------------------------------------------------ 定版
 def create_snapshot(label: Optional[str]) -> Dict[str, Any]:
-    """定版：把当前修订号下全部可确定的关系结论固化为不可变快照。"""
+    """定版：把当前修订号下全部可确定的关系结论固化为不可变快照。
+
+    成员时点一致性：定版同时冻结**当时全部已登记地层**清单（snapshots.strata，
+    membership_status=frozen）。旧版关系查询与成果包封存只接受该版成员；定版之后
+    才登记的地层不属于该版，按版外明确拒绝（STRATUM_OUTSIDE_VERSION），不会被
+    误当作旧版的“未定”成员。
+    """
     with db_conn() as conn:
         with conn.cursor() as cur:
             # 锁定修订计数器，保证快照与某一修订严格对应
@@ -239,7 +347,8 @@ def create_snapshot(label: Optional[str]) -> Dict[str, Any]:
             derivation = Derivation(active)
 
             cur.execute(
-                "INSERT INTO snapshots (revision, label, assertions) VALUES (%s, %s, %s) RETURNING version",
+                "INSERT INTO snapshots (revision, label, assertions, strata, membership_status) "
+                "VALUES (%s, %s, %s, %s, 'frozen') RETURNING version",
                 (
                     revision,
                     label,
@@ -249,6 +358,7 @@ def create_snapshot(label: Optional[str]) -> Dict[str, Any]:
                             for x in active
                         ]
                     ),
+                    Json(strata),
                 ),
             )
             version = cur.fetchone()[0]
@@ -267,14 +377,21 @@ def create_snapshot(label: Optional[str]) -> Dict[str, Any]:
                         (version, x, y, relation, Json(path)),
                     )
                     determined += 1
-            return {"version": version, "revision": revision, "conclusions": determined}
+            return {
+                "version": version,
+                "revision": revision,
+                "conclusions": determined,
+                "members": len(strata),
+                "membership_status": "frozen",
+            }
 
 
 def get_snapshot(version: int) -> Dict[str, Any]:
     with db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT version, revision, label, assertions, created_at FROM snapshots WHERE version = %s",
+                "SELECT version, revision, label, assertions, strata, membership_status, created_at "
+                "FROM snapshots WHERE version = %s",
                 (version,),
             )
             row = cur.fetchone()
@@ -285,12 +402,21 @@ def get_snapshot(version: int) -> Dict[str, Any]:
                 "revision": row[1],
                 "label": row[2],
                 "assertions": row[3],
-                "created_at": row[4].isoformat(),
+                "strata": list(row[4] or []),
+                "membership_status": row[5],
+                "created_at": row[6].isoformat(),
             }
 
 
 def query_snapshot_relationship(version: int, a: str, b: str) -> Dict[str, Any]:
     """查询历史版本结论。快照不可变，后续撤回不影响旧版结论与逐步证据明细。
+
+    成员时点一致性：只接受该定版成员，版外地层明确拒绝，不与版内真实未定混淆。
+    - frozen 定版：定版之后才登记的地层 → 400 STRATUM_OUTSIDE_VERSION；
+    - reconstructed 既有定版：无法由历史记录证实成员归属的地层
+      → 409 SNAPSHOT_MEMBERSHIP_UNDECIDABLE（明确不可判定，不伪造关系）；
+    - 当前未登记 → 400 INVALID_STRATUM；同层恒 same_period。
+    版内成员但无冻结结论行才是该版的真实“未定”。
 
     关系结论与最优证据路径取自定版冻结结论表 snapshot_conclusions，逐步明细
     按定版冻结的断言副本（snapshots.assertions，与专题成果包同一来源）逐步展开，
@@ -306,7 +432,8 @@ def query_snapshot_relationship(version: int, a: str, b: str) -> Dict[str, Any]:
                 raise ApiError(404, "SNAPSHOT_NOT_FOUND", f"版本不存在: {version}", {"version": version})
             snapshot_revision = row[0]
             frozen_by_id = {x["evidence_id"]: x for x in row[1]}
-            _ensure_strata(cur, a, b)
+            # 成员门：版外（或不可判定）地层在此明确拒绝，不会落入下方“无结论行=未定”
+            _assert_snapshot_members(cur, version, a, b)
 
             if a == b:
                 relation, path = "same_period", []

@@ -93,10 +93,36 @@ class FakeCursor:
         if norm == "SELECT REVISION, ASSERTIONS FROM SNAPSHOTS WHERE VERSION = %S":
             snap = self.conn.live["snapshots"].get(params[0])
             self._rows = [] if snap is None else [(snap["revision"], snap["assertions"])]
+        elif norm == "SELECT MEMBERSHIP_STATUS, STRATA FROM SNAPSHOTS WHERE VERSION = %S":
+            # 定版成员门：新定版冻结全部已登记地层（frozen）；夹具默认全部在册。
+            snap = self.conn.live["snapshots"].get(params[0])
+            self._rows = (
+                []
+                if snap is None
+                else [(snap.get("membership_status", "frozen"), snap.get("strata", sorted(self.conn.live["strata"])))]
+            )
         elif norm == "SELECT REVISION, LABEL, ASSERTIONS FROM SNAPSHOTS WHERE VERSION = %S":
             snap = self.conn.live["snapshots"].get(params[0])
             self._rows = (
                 [] if snap is None else [(snap["revision"], snap["label"], snap["assertions"])]
+            )
+        elif norm == (
+            "SELECT REVISION, LABEL, ASSERTIONS, MEMBERSHIP_STATUS, STRATA "
+            "FROM SNAPSHOTS WHERE VERSION = %S"
+        ):
+            snap = self.conn.live["snapshots"].get(params[0])
+            self._rows = (
+                []
+                if snap is None
+                else [
+                    (
+                        snap["revision"],
+                        snap["label"],
+                        snap["assertions"],
+                        snap.get("membership_status", "frozen"),
+                        snap.get("strata", sorted(self.conn.live["strata"])),
+                    )
+                ]
             )
         elif norm == "SELECT 1 FROM STRATA WHERE STRATUM_ID = %S":
             self._rows = [(1,)] if params[0] in self.conn.live["strata"] else []
@@ -249,7 +275,7 @@ def test_snapshot_detail_frozen_after_retractions():
 def test_snapshot_detail_matches_package_frozen_source():
     """定版查询明细与成果包证据明细同一冻结来源：逐步一致。"""
     state = sealed_state()
-    _, _, frozen_by_id = load_package_frozen(state, 1)  # 成果包封存的真实加载器
+    _, _, frozen_by_id, _membership, _members = load_package_frozen(state, 1)  # 成果包封存的真实加载器
 
     resp = run_snapshot(state, 1, "L1", "L4")
     expected = [
@@ -299,7 +325,7 @@ def test_snapshot_response_fields_unchanged():
 
 
 def test_snapshot_error_conventions_unchanged():
-    """未知定版 404 SNAPSHOT_NOT_FOUND；未知地层 400 INVALID_STRATUM。"""
+    """未知定版 404 SNAPSHOT_NOT_FOUND；未知地层 400 INVALID_STRATUM（details 附 version）。"""
     state = sealed_state()
     try:
         run_snapshot(state, 99, "L1", "L2")
@@ -313,7 +339,59 @@ def test_snapshot_error_conventions_unchanged():
         run_snapshot(state, 1, "L1", "LX")
     except ApiError as exc:
         assert exc.status_code == 400 and exc.code == "INVALID_STRATUM", exc.code
-        assert exc.details == {"stratum_id": "LX"}
+        assert exc.details == {"stratum_id": "LX", "version": 1}
+    else:
+        raise AssertionError("expected INVALID_STRATUM")
+
+
+def test_snapshot_member_gate_frozen_outside_version():
+    """frozen 定版：定版后新登记的地层按版外拒绝，不落入“无结论行=未定”。"""
+    state = sealed_state()  # 定版 1 冻结 L1..L4
+    state["snapshots"][1]["strata"] = ["L1", "L2", "L3", "L4"]
+    state["strata"].add("L9")  # 定版后才登记；不在快照成员清单中
+
+    # 版外成员即使在当前 strata 中，也明确 STRATUM_OUTSIDE_VERSION，而非 undetermined
+    try:
+        run_snapshot(state, 1, "L1", "L9")
+    except ApiError as exc:
+        assert exc.status_code == 400 and exc.code == "STRATUM_OUTSIDE_VERSION", exc.code
+        assert exc.details["reason"] == "registered_after_version"
+        assert exc.details["stratum_id"] == "L9"
+    else:
+        raise AssertionError("expected STRATUM_OUTSIDE_VERSION")
+
+    # 版内成员无结论行仍是该版真实未定（不被新门误伤）
+    state["snapshot_conclusions"].pop((1, "L3", "L1"), None)
+    resp = run_snapshot(state, 1, "L3", "L1")
+    assert resp["relation"] == "undetermined" and resp["evidence_path"] is None
+
+
+def test_snapshot_member_gate_reconstructed_undecidable():
+    """reconstructed 既有定版：可证实成员放行，不可证实成员返回不可判定。"""
+    state = sealed_state()
+    # 模拟无成员清单的旧版：只能由冻结断言/结论行证实 L1、L2（L4 为后登记地层）
+    state["snapshots"][1]["membership_status"] = "reconstructed"
+    state["snapshots"][1]["strata"] = ["L1", "L2"]
+
+    # 可证实成员（L2）的版内关系照常
+    resp = run_snapshot(state, 1, "L1", "L2")
+    assert resp["relation"] == "same_period"
+
+    # 不可证实：L4 当前已登记但不在可证实清单 -> 不可判定，不伪造“未定”
+    try:
+        run_snapshot(state, 1, "L1", "L4")
+    except ApiError as exc:
+        assert exc.status_code == 409 and exc.code == "SNAPSHOT_MEMBERSHIP_UNDECIDABLE", exc.code
+        assert exc.details["provable_members"] == ["L1", "L2"]
+        assert exc.details["stratum_id"] == "L4"
+    else:
+        raise AssertionError("expected SNAPSHOT_MEMBERSHIP_UNDECIDABLE")
+
+    # 当前未登记仍走 INVALID_STRATUM，而不是不可判定
+    try:
+        run_snapshot(state, 1, "L1", "LX")
+    except ApiError as exc:
+        assert exc.status_code == 400 and exc.code == "INVALID_STRATUM", exc.code
     else:
         raise AssertionError("expected INVALID_STRATUM")
 
@@ -377,6 +455,8 @@ ALL_TESTS = [
     test_snapshot_query_never_reads_live_assertions,
     test_snapshot_response_fields_unchanged,
     test_snapshot_error_conventions_unchanged,
+    test_snapshot_member_gate_frozen_outside_version,
+    test_snapshot_member_gate_reconstructed_undecidable,
     test_formal_query_still_shows_current_status,
     test_control_old_detail_source_would_show_retracted,
 ]

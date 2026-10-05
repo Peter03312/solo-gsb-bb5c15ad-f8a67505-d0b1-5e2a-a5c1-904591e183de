@@ -45,12 +45,20 @@ CREATE TABLE IF NOT EXISTS revisions (
 );
 
 -- 定版：不可变关系快照。结论行一旦写入永不修改、永不删除
+-- strata：定版时点**全部已登记地层**的冻结清单（成员身份按定版时点解释，
+--   定版之后新登记的地层不属该版成员）；membership_status 标记成员清单来源：
+--   frozen=定版时完整冻结；reconstructed=对缺少清单的既有定版按历史记录重建
+--   （只含可由该版冻结断言 / 结论行证实的成员，可能遗漏孤立地层，故版外判定
+--   只能在可证实时作出，不可证实时由服务层返回不可判定错误而非伪造成员关系）。
 CREATE TABLE IF NOT EXISTS snapshots (
-    version    INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    revision   INTEGER NOT NULL,
-    label      TEXT,
-    assertions JSONB NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    version           INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    revision          INTEGER NOT NULL,
+    label             TEXT,
+    assertions        JSONB NOT NULL,
+    strata            JSONB,
+    membership_status TEXT NOT NULL DEFAULT 'frozen'
+                            CHECK (membership_status IN ('frozen', 'reconstructed')),
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 CREATE TABLE IF NOT EXISTS snapshot_conclusions (
@@ -287,6 +295,15 @@ ALTER TABLE field_packages ADD COLUMN IF NOT EXISTS superseded_by_package_no TEX
 ALTER TABLE field_packages ADD COLUMN IF NOT EXISTS superseded_at TIMESTAMPTZ;
 """
 
+# 老库 snapshots 补成员清单列（全新库的 CREATE 已包含，ADD IF NOT EXISTS 幂等）。
+# 既有定版尚无冻结清单，成员清单先置空并标 reconstructed；随后由启动回填按历史
+# 记录重建可证实成员（service.backfill_snapshot_membership）。
+SCHEMA += """
+ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS strata JSONB;
+ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS membership_status TEXT NOT NULL DEFAULT 'reconstructed'
+    CHECK (membership_status IN ('frozen', 'reconstructed'));
+"""
+
 _pool: "psycopg2.pool.ThreadedConnectionPool | None" = None
 
 
@@ -306,6 +323,10 @@ def init_pool(retries: int = 30, delay: float = 1.0) -> None:
                         from .changes import backfill_revision_changes
 
                         backfill_revision_changes(cur)
+                        # 启动幂等重建既有定版（无冻结成员清单）的可证实成员清单
+                        from .service import backfill_snapshot_membership
+
+                        backfill_snapshot_membership(cur)
             finally:
                 pool.putconn(conn)
             _pool = pool
